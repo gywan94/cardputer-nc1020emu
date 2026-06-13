@@ -227,13 +227,20 @@ void nor_flash_write(uint32_t off, const uint8_t *src, uint32_t len) {
             }
         }
         if (!needs_erase) {
-            if (differs) esp_partition_write(s_nor_part, off, src, len);   /* program-only */
+            if (differs) {                                                 /* program-only */
+                esp_err_t e = esp_partition_write(s_nor_part, off, src, len);
+                if (e != ESP_OK) ESP_LOGE(TAG, "nor program @0x%lx failed: %s",
+                                          (unsigned long)off, esp_err_to_name(e));
+            }
             return;                                                        /* identical: skip */
         }
     }
     /* Real erase needed (or scratch unavailable): the original safe path. */
-    esp_partition_erase_range(s_nor_part, off, len);
-    esp_partition_write(s_nor_part, off, src, len);
+    esp_err_t e1 = esp_partition_erase_range(s_nor_part, off, len);
+    esp_err_t e2 = esp_partition_write(s_nor_part, off, src, len);
+    if (e1 != ESP_OK || e2 != ESP_OK)
+        ESP_LOGE(TAG, "nor erase+write @0x%lx failed: erase=%s write=%s",
+                 (unsigned long)off, esp_err_to_name(e1), esp_err_to_name(e2));
 }
 
 void nor_flash_erase_all(void) {

@@ -55,15 +55,22 @@ void save_state(string file_name){
 		remove(tmp_name.c_str());
 		return;
 	}
-	/* FAT rename() fails if the destination exists, so drop it first. Crash window here
-	 * is tiny (a directory-entry op) and the worst case is a missing .state -> a clean
-	 * cold boot, never a corrupt one. */
-	remove(file_name.c_str());
+	/* Swap the new save in. FAT rename() can't overwrite, so move the current save aside
+	 * to .bak first; if the rename then fails we roll .bak back — so a failure can never
+	 * lose BOTH saves (the previous bug: remove(dest) then a failed rename left nothing).
+	 * On success drop .bak. If we crash mid-swap, the next boot's load_state recovers from
+	 * .tmp/.bak. */
+	string bak_name = file_name + ".bak";
+	remove(bak_name.c_str());                        /* clear any stale backup        */
+	rename(file_name.c_str(), bak_name.c_str());     /* current save -> .bak (ok if absent) */
 	if (rename(tmp_name.c_str(), file_name.c_str()) != 0) {
-		printf("state rename %s -> %s failed (errno=%d)\n", tmp_name.c_str(), file_name.c_str(), errno);
+		printf("state rename %s -> %s failed (errno=%d) — rolling back previous save\n",
+			tmp_name.c_str(), file_name.c_str(), errno);
+		rename(bak_name.c_str(), file_name.c_str()); /* restore the previous good save */
 		remove(tmp_name.c_str());
 		return;
 	}
+	remove(bak_name.c_str());                        /* success -> drop the backup    */
 	printf("state saved to file %s!!\n",file_name.c_str());
 }
 
@@ -85,10 +92,23 @@ bool load_state(){
 	bool def_lcden = nc2k_states.lcden;
 	uint16_t def_lcdbuffaddr = nc2k_states.lcdbuffaddr;
 	
-	FILE* file = fopen(nc2k_rom.statesPath.c_str(), "rb");
+	/* Recover from an interrupted save: the canonical .state can be missing only if a
+	 * crash hit between the .bak/.tmp rename steps in save_state — and in that window a
+	 * COMPLETE copy still exists. Prefer the newest: .tmp (new save, fully written but not
+	 * yet swapped in) then .bak (previous good save). The ret==size check below still
+	 * guards against any partial file, so recovery can't load garbage. */
+	string spath = nc2k_rom.statesPath;
+	FILE* file = fopen(spath.c_str(), "rb");
 	if (file == NULL) {
-		printf("states file %s open failed (errno = %d), skip loading!\n", nc2k_rom.statesPath.c_str(), errno);
-		return false;
+		string tmp = spath + ".tmp", bak = spath + ".bak";
+		if ((file = fopen(tmp.c_str(), "rb")) != NULL)
+			printf("primary .state missing — recovering from %s\n", tmp.c_str());
+		else if ((file = fopen(bak.c_str(), "rb")) != NULL)
+			printf("primary .state missing — recovering from %s\n", bak.c_str());
+		if (file == NULL) {
+			printf("no state file (.state/.tmp/.bak, errno=%d) — skip loading!\n", errno);
+			return false;
+		}
 	}
 	int size = &nc2k_states.SAVE_STATE_END - &nc2k_states.SAVE_STATE_BEGIN;
 	printf("about to read %d bytes from state file...\n", size);
