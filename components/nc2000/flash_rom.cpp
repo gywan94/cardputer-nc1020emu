@@ -204,7 +204,34 @@ void nor_flash_read(uint32_t off, uint8_t *dst, uint32_t len) {
 
 void nor_flash_write(uint32_t off, const uint8_t *src, uint32_t len) {
     if (!s_nor_part || off + len > s_nor_part->size) return;
-    /* Flash must be erased before write; off/len are 8 KB page aligned (2 sectors). */
+    /* Fast path — skip the erase when the page only CLEARS bits. Flash programming can
+     * turn a 1 into a 0 without erasing; only setting a bit back to 1 needs the (~tens
+     * of ms) erase. The emulated NOR byte-program is `&=` (bit-clear only), so a flushed
+     * page is almost always a subset of what's already in flash → program-only, no erase.
+     * Only a real NOR erase command (memset 0xff → sets bits) takes the slow path. Kills
+     * the periodic write-back stall + flash wear. Safe: flash encryption is OFF (re-
+     * programming already-written cells to a subset value is well-defined unencrypted). */
+    static uint8_t *cur = NULL;     /* scratch for the current page; lazily heap-alloc'd */
+    static uint32_t cap = 0;        /* AFTER SD mount, so it can't reopen the boot-time   */
+    if (!cur) {                     /* NO_MEM mount failure that shrinking the slot pool   */
+        cap = len;                  /* was meant to avoid. */
+        cur = (uint8_t *)heap_caps_malloc(cap, MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+    }
+    if (cur && len <= cap &&
+        esp_partition_read(s_nor_part, off, cur, len) == ESP_OK) {
+        bool needs_erase = false, differs = false;
+        for (uint32_t i = 0; i < len; i++) {
+            if (src[i] != cur[i]) {
+                differs = true;
+                if (src[i] & (uint8_t)~cur[i]) { needs_erase = true; break; }  /* a 0->1 bit */
+            }
+        }
+        if (!needs_erase) {
+            if (differs) esp_partition_write(s_nor_part, off, src, len);   /* program-only */
+            return;                                                        /* identical: skip */
+        }
+    }
+    /* Real erase needed (or scratch unavailable): the original safe path. */
     esp_partition_erase_range(s_nor_part, off, len);
     esp_partition_write(s_nor_part, off, src, len);
 }
