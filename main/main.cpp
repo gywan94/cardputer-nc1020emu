@@ -16,6 +16,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"   /* Core0->Core1 frame queue (no shared 6502 RAM) */
+#include "esp_heap_caps.h"    /* heap-alloc the audio ring after SD mount */
 
 #include "cardputer_bsp.h"
 #include "comm.h"
@@ -687,6 +688,95 @@ static void display_task(void *arg)
     }
 }
 
+/* ── Audio ring (Phase 1 beeper) ─────────────────────────────────────────────
+ * Core 0's beeper (cardputer_stubs.cpp) pushes square-wave samples here; the
+ * Core-1 audio_task drains them to the I2S speaker. SPSC lock-free ring with
+ * free-running unsigned counters (power-of-2 size); heap-alloc'd AFTER SD mount
+ * so it can't re-trigger the boot NO_MEM. */
+#define AUD_RING_N 2048                       /* ~46 ms @44100, 4 KB */
+static int16_t *g_aud_ring = NULL;
+static volatile uint32_t g_aud_head = 0, g_aud_tail = 0;
+
+extern "C" void audio_push_samples(const int16_t *s, int n)   /* called on Core 0 */
+{
+    if (!g_aud_ring) return;
+    uint32_t head = g_aud_head;
+    const uint32_t tail = g_aud_tail;                 /* snapshot (written by Core 1) */
+    for (int i = 0; i < n; i++) {
+        if (head - tail >= AUD_RING_N) break;         /* full -> drop */
+        g_aud_ring[head & (AUD_RING_N - 1)] = s[i];
+        head++;
+    }
+    g_aud_head = head;
+}
+
+static int audio_pop(int16_t *out, int n)             /* called on Core 1 */
+{
+    const uint32_t head = g_aud_head;                 /* snapshot (written by Core 0) */
+    uint32_t tail = g_aud_tail;
+    int got = 0;
+    while (got < n && tail != head) { out[got++] = g_aud_ring[tail & (AUD_RING_N - 1)]; tail++; }
+    g_aud_tail = tail;
+    return got;
+}
+
+/* Core 1: keep the I2S DMA continuously fed — real samples when the beeper is
+ * sounding, silence otherwise (i2s_channel_write blocks on the DMA, which paces
+ * this loop at the 44100 Hz output rate, so no busy-spin and no underrun click). */
+/* The beeper FIFO is fed continuously (the firmware's resting level too), so we
+ * can't use "ring empty" as idle. Instead DC-block each chunk (a steady level ->
+ * ~0) and watch the post-filter peak: real sound has transitions, idle is ~0.
+ * After ~80 ms with no real sound, STOP the I2S (amp standby -> no hiss); resume
+ * the instant a transition appears. The channel starts enabled (init + beep test),
+ * so we begin active. */
+static void audio_task(void *arg)
+{
+    (void)arg;
+    int16_t chunk[256];
+    float hp_x1 = 0.0f, hp_y1 = 0.0f;          /* one-pole DC blocker (~35 Hz HP) */
+    const float R = 0.995f;
+    const int   SILENCE_THRESH = 300;          /* |sample| below this = silence    */
+    const int   IDLE_SAMPLES   = 44100 / 30;   /* ~33 ms of silence -> pause (short
+                                                * so a lone idle beeper tick blips
+                                                * the amp only briefly, not 80ms)  */
+    bool active = true;
+    int  silent_run = 0;
+    int16_t last_raw = 0;                       /* HOLD this on underrun (not 0) */
+    for (;;) {
+        int got = audio_pop(chunk, 256);
+        if (got == 0) {                        /* ring momentarily empty */
+            if (!active) { vTaskDelay(pdMS_TO_TICKS(3)); continue; }
+            for (int i = 0; i < 128; i++) chunk[i] = last_raw;  /* hold level -> no step */
+            got = 128;
+        } else {
+            last_raw = chunk[got - 1];         /* remember last real level */
+        }
+        int peak = 0;
+        for (int i = 0; i < got; i++) {        /* DC-block + clamp, track peak */
+            float x = chunk[i];
+            float y = x - hp_x1 + R * hp_y1;
+            hp_x1 = x; hp_y1 = y;
+            int v = (int)y;
+            v = (v > 32767) ? 32767 : (v < -32768 ? -32768 : v);
+            chunk[i] = (int16_t)v;
+            int a = v < 0 ? -v : v;
+            if (a > peak) peak = a;
+        }
+        if (peak >= SILENCE_THRESH) {          /* real sound */
+            silent_run = 0;
+            if (!active) { cp_audio_resume(); active = true; }
+        } else {
+            silent_run += got;
+        }
+        if (active) {
+            cp_audio_write(chunk, got);        /* blocks on DMA -> paces */
+            if (silent_run >= IDLE_SAMPLES) { cp_audio_pause(); active = false; silent_run = 0; }
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(3));      /* idle: drained ring above, amp off */
+        }
+    }
+}
+
 extern "C" void app_main(void) {
     ESP_LOGI(TAG, "=== cardputer-nc1020 (wqx) M2 self-test ===");
 
@@ -707,6 +797,19 @@ extern "C" void app_main(void) {
     fill_screen(sd_ok ? 0x07E0 : 0xF800);      /* green ok / red SD fail        */
 
     cp_kbd_init();
+
+    /* Audio bring-up (Phase 1: beeper). Play a two-note startup tone, then start
+     * the Core-1 audio task draining the beeper ring to I2S. Ring is heap-alloc'd
+     * AFTER the SD mount above so its 4 KB can't re-trigger the boot NO_MEM. */
+    if (cp_audio_init()) {
+        cp_audio_beep_test();
+        g_aud_ring = (int16_t *)heap_caps_malloc(AUD_RING_N * sizeof(int16_t),
+                                                 MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+        if (g_aud_ring)
+            xTaskCreatePinnedToCore(audio_task, "audio", 3072, NULL, 6, NULL, 1);
+        else
+            ESP_LOGW(TAG, "audio ring alloc failed — beeper disabled");
+    }
 
     /* G0 button (GPIO0) — press it to force an immediate save (NOR + state). */
     gpio_config_t g0cfg = { .pin_bit_mask = 1ULL << 0, .mode = GPIO_MODE_INPUT,
