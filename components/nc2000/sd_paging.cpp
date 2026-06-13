@@ -12,13 +12,12 @@
  * fragmented (largest contiguous block ~72 KB) to hold 32 KB slots. 8 KB slots
  * pack into the fragments and let enough banks stay pinned per bus switch. */
 #define SDPG_PAGE    0x2000u   /* 8 KB per slot                                   */
-#define SDPG_NSLOTS  8         /* 8*8KB = 64 KB. Max live pages/switch is 6 (4      */
-                               /* subpages + nor[0] + nor[bbs]), so 8 keeps a 2-slot */
-                               /* margin. Was 14 then 10; cut to 8 to free another   */
-                               /* 16KB for the Phase-1 audio (ring + I2S DMA + task  */
-                               /* stack) — display_task alloc was failing. ROM+NOR  */
-                               /* are in flash so SD reads are ~0 and the paging     */
-                               /* cache is barely used anyway.                       */
+#define SDPG_NSLOTS  10        /* 10*8KB = 80 KB. Max live pages/switch is 6 (4    */
+                               /* subpages + nor[0] + nor[bbs]). Was 14 (112KB);   */
+                               /* cut to free ~32KB internal RAM for the FAT/SD     */
+                               /* mount (it failed with NO_MEM 0x101 after recent   */
+                               /* static allocs). ROM+NOR are in flash so SD reads  */
+                               /* are ~0 and the paging cache is barely used.       */
 #define ROM_PAGES    1536u     /* 12 MB / 8 KB = 384 banks * 4                     */
 
 static const char *TAG = "sdpg";

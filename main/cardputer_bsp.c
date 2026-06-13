@@ -5,8 +5,6 @@
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "driver/sdspi_host.h"
-#include "driver/i2s_std.h"
-#include <math.h>
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"
@@ -31,12 +29,6 @@ static const char *TAG = "cp_bsp";
 
 #define LCD_HOST  SPI2_HOST
 #define SD_HOST   SPI3_HOST
-
-/* Speaker (NS4168 I2S amp) — M5Cardputer */
-#define SPK_BCLK  41
-#define SPK_WS    43
-#define SPK_DOUT  42
-#define SPK_RATE  44100
 
 /* ── Display (ST7789, 240x135 landscape; native 135x240 panel) ──────────── */
 static esp_lcd_panel_handle_t s_panel;
@@ -174,64 +166,4 @@ int cp_kbd_scan(cp_key_t *out, int max)
         }
     }
     return n;
-}
-
-/* ── Audio (I2S std TX -> NS4168 speaker; 44100 Hz, 16-bit, mono) ─────────── */
-static i2s_chan_handle_t s_tx;
-
-bool cp_audio_init(void)
-{
-    i2s_chan_config_t cc = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    if (i2s_new_channel(&cc, &s_tx, NULL) != ESP_OK) { ESP_LOGE(TAG, "i2s_new_channel failed"); return false; }
-    i2s_std_config_t std = {
-        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(SPK_RATE),
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
-        .gpio_cfg = {
-            .mclk = I2S_GPIO_UNUSED, .bclk = SPK_BCLK, .ws = SPK_WS,
-            .dout = SPK_DOUT, .din = I2S_GPIO_UNUSED,
-            .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false },
-        },
-    };
-    if (i2s_channel_init_std_mode(s_tx, &std) != ESP_OK) { ESP_LOGE(TAG, "i2s init_std failed"); return false; }
-    if (i2s_channel_enable(s_tx) != ESP_OK) { ESP_LOGE(TAG, "i2s enable failed"); return false; }
-    ESP_LOGI(TAG, "audio I2S ready (bclk=%d ws=%d dout=%d @%dHz)", SPK_BCLK, SPK_WS, SPK_DOUT, SPK_RATE);
-    return true;
-}
-
-void cp_audio_write(const int16_t *samples, int n)
-{
-    if (!s_tx || n <= 0) return;
-    size_t wrote = 0;
-    i2s_channel_write(s_tx, samples, (size_t)n * sizeof(int16_t), &wrote, portMAX_DELAY);
-}
-
-/* Stop the I2S clock so the NS4168 amp drops to standby (no continuous-feed hiss);
- * the audio task calls these around runs of real sound. Enable/disable are only
- * called on a real active<->idle transition, so no rapid toggling. */
-void cp_audio_pause(void)  { if (s_tx) i2s_channel_disable(s_tx); }
-void cp_audio_resume(void) { if (s_tx) i2s_channel_enable(s_tx); }
-
-/* Short startup tone so the speaker/pins can be confirmed on hardware. Two beeps:
- * 880 Hz then 1320 Hz, ~125 ms each. Generated in a SMALL stack buffer (a big
- * static .bss buffer re-triggered the SD-mount NO_MEM), phase kept continuous. */
-void cp_audio_beep_test(void)
-{
-    if (!s_tx) return;
-    int16_t buf[256];
-    const int amp = 6000;
-    const int freqs[3] = { 880, 1320, 0 };   /* 0 = trailing silence */
-    for (int f = 0; f < 3; f++) {
-        int total  = (freqs[f] == 0) ? SPK_RATE / 20 : SPK_RATE / 8;   /* 50ms / 125ms */
-        int period = (freqs[f] == 0) ? 2 : SPK_RATE / freqs[f];
-        int phase  = 0;
-        while (total > 0) {
-            int n = total < 256 ? total : 256;
-            for (int i = 0; i < n; i++) {
-                buf[i] = (freqs[f] == 0) ? 0 : ((phase < period / 2) ? amp : -amp);
-                if (++phase >= period) phase = 0;
-            }
-            cp_audio_write(buf, n);
-            total -= n;
-        }
-    }
 }

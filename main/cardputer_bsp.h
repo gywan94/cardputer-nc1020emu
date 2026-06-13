@@ -24,13 +24,6 @@ void cp_lcd_draw(int x0, int y0, int x1, int y1, const uint16_t *px);
 /* SD card (SPI). Mounts at /sd. Returns true on success. */
 bool cp_sd_init(void);
 
-/* Audio (I2S to the NS4168 speaker amp, 44100 Hz mono S16). */
-bool cp_audio_init(void);                          /* true on success           */
-void cp_audio_write(const int16_t *samples, int n);/* blocking; n mono samples  */
-void cp_audio_beep_test(void);                     /* short startup tone (pin check) */
-void cp_audio_pause(void);                          /* stop I2S clk -> amp standby (no hiss) */
-void cp_audio_resume(void);                         /* restart I2S before writing    */
-
 /* Keyboard matrix. Returns up to `max` pressed logical keys as (x,y) in [0..13]
  * x and [0..3] y (the M5Cardputer layout grid). Returns the count. */
 typedef struct { uint8_t x, y; } cp_key_t;
