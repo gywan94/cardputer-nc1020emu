@@ -1,0 +1,11 @@
+# nc1020-cardputer-fast — 8MB flash: 1MB app + 6.44MB ROM cache + 512KB NOR.
+#  romdata: first 206 32KB ROM banks, auto-copied from SD on first boot then
+#           mmapped read-only (the dictionary) — no SD paging.
+#  nordata: the 512KB read-write NOR (user data 资料/记事/通讯录), kept in flash
+#           so it survives without the SD .nor file.
+# Name,    Type, SubType, Offset,   Size
+nvs,       data, nvs,     0x9000,   0x6000
+phy_init,  data, phy,     0xf000,   0x1000
+factory,   app,  factory, 0x10000,  0x100000
+romdata,   data, 0x40,    0x110000, 0x670000
+nordata,   data, 0x41,    0x780000, 0x80000

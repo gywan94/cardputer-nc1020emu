@@ -1,0 +1,25 @@
+# ESP-IDF build output
+/build/
+sdkconfig
+sdkconfig.old
+
+# IDE / caches
+.cache/
+.trae/
+.vscode/
+.idea/
+
+# dev logs / serial captures (build_*.txt, flash_*.txt, boot*.txt, lcd_*.txt, ...)
+*.txt
+
+# binaries & ROM/flash images — never commit (size + copyrighted NC1020 ROM/NOR)
+*.bin
+*.rom
+*.nor
+*.nand
+*.fls
+*.state
+
+# misc
+*.swp
+*~
