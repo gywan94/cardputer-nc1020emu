@@ -713,6 +713,11 @@ extern "C" void app_main(void) {
                             .pull_up_en = GPIO_PULLUP_ENABLE };
     gpio_config(&g0cfg);
 
+    /* Capture G0 at power-on BEFORE the menu (which may release it). Holding G0 at
+     * boot forces a fast ROM/NOR REFRESH from SD: the 6.4MB ROM is re-copied only if
+     * its signature changed, but the small NOR is always re-imported (see below). */
+    bool g0_boot = (gpio_get_level(GPIO_NUM_0) == 0);
+
     /* Pick which ROM to boot: hold G0 at boot for the on-screen menu, otherwise
      * reuse the last-selected ROM. Falls back to /sd/nc1020 if none chosen. */
     static char rombase[80] = "/sd/nc1020";
@@ -731,8 +736,12 @@ extern "C" void app_main(void) {
         void rom_progress(int pct);
         flash_rom_prepare(nc2k_rom.romPath.c_str(), rom_progress);
         /* Re-seed NOR only when the ROM was actually re-copied to flash (content
-         * changed) — keeps a matching ROM+NOR pair and blanks a stale NOR on switch. */
-        nor_flash_prepare(nc2k_rom.norFlashPath.c_str(), 512 * 1024, flash_rom_repopulated());
+         * changed) — keeps a matching ROM+NOR pair and blanks a stale NOR on switch.
+         * Also re-seed when G0 is held at boot: a fast manual refresh that re-imports
+         * the 512KB NOR from SD (or blanks it if there's no .nor) without re-copying an
+         * unchanged 6.4MB ROM. */
+        nor_flash_prepare(nc2k_rom.norFlashPath.c_str(), 512 * 1024,
+                          flash_rom_repopulated() || g0_boot);
     }
     /* A newly selected/flashed ROM must not inherit the previous ROM's saved state
      * (it would load garbage and could lock up). Wipe it so the new ROM cold-boots. */
