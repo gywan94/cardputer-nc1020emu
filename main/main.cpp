@@ -193,31 +193,35 @@ bool is_grey_mode();
  * (integer scale) is the only way horizontal lines stay perfectly level: any
  * fractional stretch to fill 240x135 lands some source rows on 1 panel row and some
  * on 2, making lines ragged. 1bpp MSB-first (1=dark) / 2bpp grey. */
-static void draw_lcd(const uint8_t *fb)
+/* Draw only the native rectangle [nx0,nx1) x [ny0,ny1). NATIVE 135x240 portrait
+ * frame; landscape (lx=ny, ly=nx) nearest-neighbour scale of the 160x80 image,
+ * rotated in software. Redrawing only the changed rect (not all 240 rows every
+ * time) kills the once-a-second full-screen rewrite that read as flicker. */
+static void draw_lcd_rect(const uint8_t *fb, int nx0, int ny0, int nx1, int ny1)
 {
     static const uint16_t lvl[4] = {
         RGB565(245,245,245), RGB565(180,180,180), RGB565(105,105,105), RGB565(0,0,0) };
-    /* The panel is drawn in its NATIVE 135x240 portrait frame (swap_xy sheared the
-     * image). Held landscape (keyboard down) the long native axis (ny 0..239) is
-     * the horizontal, the short axis (nx 0..134) is vertical. So map landscape
-     * (lx=ny, ly=nx) and nearest-neighbour scale the 160x80 NC1020 image to fill,
-     * rotating 90deg in software (one 135px strip per native row). */
     static uint16_t line[NAT_W];
     const bool grey = is_grey_mode();
-    for (int ny = 0; ny < NAT_H; ny++) {                 /* native row = landscape x */
-        int lx = ny;                                     /* horizontal (mirrored), 0..239 */
-        int sx = lx * LCD_SRC_W / NAT_H;                 /* source col 0..159 */
-        for (int nx = 0; nx < NAT_W; nx++) {             /* native col = landscape y */
-            int ly = NAT_W - 1 - nx;                     /* vertical (upright), 0..134 */
+    if (nx0 < 0) nx0 = 0;
+    if (ny0 < 0) ny0 = 0;
+    if (nx1 > NAT_W) nx1 = NAT_W;
+    if (ny1 > NAT_H) ny1 = NAT_H;
+    if (nx0 >= nx1 || ny0 >= ny1) return;
+    for (int ny = ny0; ny < ny1; ny++) {
+        int sx = ny * LCD_SRC_W / NAT_H;                 /* source col 0..159 */
+        for (int nx = nx0; nx < nx1; nx++) {
+            int ly = NAT_W - 1 - nx;
             int sy = ly * LCD_SRC_H / NAT_W;             /* source row 0..79 */
             int pos = sy * LCD_SRC_W + sx, val;
             if (!grey) val = ((fb[pos >> 3] >> (7 - (pos & 7))) & 1) ? 3 : 0;
             else       val = (fb[pos >> 2] >> (6 - (pos & 3) * 2)) & 3;
-            line[nx] = lvl[val];
+            line[nx - nx0] = lvl[val];
         }
-        cp_lcd_draw(0, ny, NAT_W, ny + 1, line);
+        cp_lcd_draw(nx0, ny, nx1, ny + 1, line);
     }
 }
+static inline void draw_lcd(const uint8_t *fb) { draw_lcd_rect(fb, 0, 0, NAT_W, NAT_H); }
 
 /* Dump the 160x80 frame to serial as 80x40 ASCII art so the display content can
  * be verified without looking at the panel. ' '=white .=light :=dark #=black. */
@@ -400,6 +404,12 @@ static void wqx_configure(const char *base)
      * correct it once via the NC1020 menu, and it then persists via the saved
      * state and advances with the emulator. */
     enable_auto_time_sync = false;
+    /* The 6502 interpreter runs at ~76% realtime, so the NC1020 RTC (driven by
+     * emulated cycles) ran 24% slow and the clock drifted behind. Scale the RTC
+     * timebase by 1/0.76 ≈ 1.32 so it ticks at real rate — set the time once in the
+     * NC1020 menu and it then tracks the wall clock (approx; drifts a little under
+     * heavy load when emulation dips below 76%). */
+    rtc_speed = 1.32;
     cpu_batch = 4096;
     init_keyitems();
 }
@@ -500,6 +510,85 @@ static void panel_test(void)
     for (;;) vTaskDelay(pdMS_TO_TICKS(200));
 }
 
+/* ── 6502-JIT feasibility probe ──────────────────────────────────────────────
+ * The interpreter runs at ~185 real Xtensa cycles per 6502 instruction (76%%
+ * realtime). A JIT would eliminate the DISPATCH (opcode fetch + 256-way switch +
+ * PC advance + register reload + loop) but NOT the irreducible MEM+ALU "floor".
+ * Measure both on real hardware to estimate the achievable JIT speedup.
+ * Must run AFTER LoadNC2k() (memmap must be valid). */
+#define JIT_PROBE 0
+#if JIT_PROBE
+static void bench_jit_feasibility(void) {
+    extern uint8_t* memmap[8];
+    const int N = 4000000;
+    volatile uint32_t sink = 0;
+
+    /* (1) irreducible FLOOR: a representative op's work — 2 operand reads + ALU +
+     * NZ flags + a data access, via the real page-table memmap (real cache behaviour).
+     * A JIT still pays this. */
+    {
+        uint16_t a = 0x8000; uint8_t acc = 0, nz = 0; uint32_t s = 0;
+        int64_t t0 = esp_timer_get_time();
+        for (int i = 0; i < N; i++) {
+            uint8_t v0 = memmap[a >> 13][a & 0x1FFF];
+            uint8_t v1 = memmap[(a + 1) >> 13][(a + 1) & 0x1FFF];
+            acc = (uint8_t)(acc + v0 + v1);
+            nz = (uint8_t)((acc == 0 ? 2 : 0) | (acc & 0x80));   /* N/Z flags */
+            s += memmap[(a + acc) >> 13][(a + acc) & 0x1FFF] + nz;
+            a += 5; if (a > 0xfc00) a = 0x8000;
+        }
+        int64_t dt = esp_timer_get_time() - t0; sink += s;
+        ESP_LOGW(TAG, "[JIT probe] FLOOR (mem+ALU+flags, no dispatch): %.0f real-cyc/op",
+                 (double)dt * 1000.0 / N * 240.0 / 1000.0);
+    }
+    /* (1b) FLOOR but flags written to GLOBAL memory (like the interpreter's mN/mZ in
+     * nc2k_states) instead of a local — isolates the cost of global flag state. */
+    {
+        static volatile uint8_t gN, gZ, gC;   /* stand-in for the interpreter's globals */
+        uint16_t a = 0x8000; uint8_t acc = 0; uint32_t s = 0;
+        int64_t t0 = esp_timer_get_time();
+        for (int i = 0; i < N; i++) {
+            uint8_t v0 = memmap[a >> 13][a & 0x1FFF];
+            uint8_t v1 = memmap[(a + 1) >> 13][(a + 1) & 0x1FFF];
+            acc = (uint8_t)(acc + v0 + v1);
+            gZ = (acc == 0); gN = (acc & 0x80) ? 1 : 0; gC = (v0 + v1) > 255;  /* global flags */
+            s += memmap[(a + acc) >> 13][(a + acc) & 0x1FFF];
+            a += 5; if (a > 0xfc00) a = 0x8000;
+        }
+        int64_t dt = esp_timer_get_time() - t0; sink += s + gN + gZ + gC;
+        ESP_LOGW(TAG, "[JIT probe] FLOOR + GLOBAL flags: %.0f real-cyc/op",
+                 (double)dt * 1000.0 / N * 240.0 / 1000.0);
+    }
+    /* (2) DISPATCH overhead: opcode fetch + a dense 256-entry function-pointer dispatch
+     * (like switch(mOpcode)) + PC advance. A JIT eliminates this entirely. */
+    {
+        static uint8_t prog[8192];
+        for (int i = 0; i < 8192; i++) prog[i] = (uint8_t)(i * 7 + 3);   /* pseudo opcodes */
+        uint16_t pc = 0; uint32_t s = 0;
+        int64_t t0 = esp_timer_get_time();
+        for (int i = 0; i < N; i++) {
+            uint8_t op = prog[pc & 0x1FFF];
+            switch (op) {
+                case 0xA5: case 0xA9: s += 1; break;
+                case 0x85: case 0x8D: s += 2; break;
+                case 0xE8: case 0xC8: s += 3; break;
+                case 0xD0: case 0xF0: s += 4; break;
+                case 0x4C: case 0x6C: s += 5; break;
+                case 0x20: case 0x60: s += 6; break;
+                default:               s += op; break;
+            }
+            pc += 1;
+        }
+        int64_t dt = esp_timer_get_time() - t0; sink += s;
+        ESP_LOGW(TAG, "[JIT probe] DISPATCH (fetch+switch+pc): %.0f real-cyc/op",
+                 (double)dt * 1000.0 / N * 240.0 / 1000.0);
+    }
+    (void)sink;
+    ESP_LOGW(TAG, "[JIT probe] interpreter ~185 cyc/op (76%%RT). JIT estimate ~= FLOOR + small; "
+                  "speedup ~= 185 / (FLOOR). Compare the two numbers above.");
+}
+#endif
+
 extern "C" void app_main(void) {
     ESP_LOGI(TAG, "=== cardputer-nc1020 (wqx) M2 self-test ===");
 
@@ -589,9 +678,10 @@ extern "C" void app_main(void) {
     }
     fill_screen(0x0000);                  /* black; LCD frame is drawn centred */
     ui_free();                            /* release the boot-UI framebuffer (~4KB) */
-    int flush_tick = 0, hb = 0, dump_tick = 0;
-    int64_t boot_us = esp_timer_get_time();   /* for skipping the format-prompt warmup */
-    int64_t last_change_us = boot_us;         /* when the LCD last changed (idle detect) */
+#if JIT_PROBE
+    bench_jit_feasibility();              /* one-shot: estimate JIT speedup potential */
+#endif
+    int flush_tick = 0, hb = 0;
     uint32_t last_reads = 0;
 #define KEY_SWEEP_TEST 0     /* interactivity confirmed; physical keyboard now drives it */
     for (;;) {
@@ -649,100 +739,42 @@ extern "C" void app_main(void) {
             }
         }
 #endif
-        bool lcd_copied = CopyLcdBuffer(lcd_buf);
-        if (lcd_copied) {
-            /* A genuinely powered NC1020 screen always has non-zero pixels (status
-             * strip etc.); an all-zero frame means the firmware is in standby and
-             * hasn't painted (e.g. right after a warm-resume). Skip blank frames so
-             * we never paint a misleading screen and so the last real image stays. */
+        /* Single-core synchronous draw (the version that looked clean). Snapshot the
+         * NC1020 frame, skip blank/unchanged frames, and blit it right here. Dual-core
+         * offload of the blit hurt image quality (async timing) without speeding up
+         * the run — the 6502 interpreter, not the display, is the bottleneck. */
+        if (CopyLcdBuffer(lcd_buf)) {
             bool blank = true;
             for (size_t i = 0; i < sizeof(lcd_buf); i++) if (lcd_buf[i]) { blank = false; break; }
-            /* Only repaint when the frame actually changed — the NC1020 screen is
-             * static while idle, so this skips the 240x120 SPI blit most frames
-             * (memcmp of 1.6-3.2KB is far cheaper than the draw). */
             static uint8_t prev[sizeof(lcd_buf)];
             if (!blank && memcmp(lcd_buf, prev, sizeof(lcd_buf)) != 0) {
                 draw_lcd(lcd_buf);
                 memcpy(prev, lcd_buf, sizeof(lcd_buf));
-                last_change_us = esp_timer_get_time();   /* screen changed -> not idle */
-            }
-#define LCD_ASCII_DUMP 0          /* 1 to stream the frame to serial as ASCII art */
-#if LCD_ASCII_DUMP
-            if (++dump_tick >= 60) { dump_tick = 0; dump_lcd_ascii(lcd_buf); }
-#else
-            (void)dump_tick;
-#endif
-        }
-#define LCD_FRAME_DBG 0   /* 1 -> log copied/nonzero/addr each ~0.5s (resume debugging) */
-#if LCD_FRAME_DBG
-        /* nonzero==0 means the displayed framebuffer is blank -> firmware in standby
-         * (e.g. saved at clk-off and not yet repainted), not a draw bug. */
-        {
-            static int lcd_dbg = 0;
-            if (++lcd_dbg >= 30) {
-                lcd_dbg = 0;
-                int nz = 0;
-                for (size_t i = 0; i < sizeof(lcd_buf); i++) if (lcd_buf[i]) nz++;
-                ESP_LOGI(TAG, "LCD: copied=%d nonzero=%d/%d addr=0x%x grey=%d",
-                         (int)lcd_copied, nz, (int)sizeof(lcd_buf),
-                         (unsigned)(nc2k_states.lcdbuffaddr & nc2k_states.lcdbuffaddrmask),
-                         (int)is_grey_mode());
             }
         }
-#else
-        (void)lcd_copied;
-#endif
+
         /* Persist dirty NOR pages to SD ~every 5 s so user data survives a
          * power-off (NC1020 has no clean shutdown). Cheap when nothing changed. */
         if (++flush_tick >= 150) { flush_tick = 0; sdpg_flush(); }
 
-        /* State persistence. The full RAM snapshot (~99 KB SD write) is taken at safe
-         * moments so the next boot can resume instead of cold-booting into the
-         * "是否清除闪存" prompt every time:
-         *   (a) the instant the machine goes idle (clk-off), and
-         *   (b) whenever the screen has been STATIC for >4 s (firmware sitting at a
-         *       menu/home, polling keys — a safe point to snapshot), throttled to once
-         *       per 30 s, and only after a 25 s warm-up so we don't capture the initial
-         *       cold-boot format prompt.
-         * The clk-off-only gate alone almost never fired in short sessions (the NC1020
-         * only idles after its multi-minute auto-power-off), so the state never saved
-         * and every boot was cold. Saving at a static screen is safe (no NOR op in
-         * flight; NOR is flash-backed, no SD-read conflict). NOR (user data) is also
-         * flushed every ~5 s above, so documents survive a power cut regardless. */
+        /* State persistence = **G0 manual save ONLY** (auto-save removed per request).
+         * Press G0 to snapshot the ~99 KB RAM state to SD; nothing saves automatically,
+         * so the periodic mid-session SD-write freeze is gone (it was also disturbing
+         * the image). Remember to press G0 before powering off, or the next boot
+         * cold-boots into "是否清除闪存". NOR (documents) still flushes every ~5 s above. */
         {
-            bool clk_off = (nc2k_states.ram_io[0x05] >> 5) == 7;
-            static int64_t last_save_us = 0;
-            static bool clk_off_prev = false;
             static int g0_prev = 1;
-            int64_t now = esp_timer_get_time();
-            bool did_save = false;
-            /* G0 = manual SAVE button (press it any time to snapshot now). Edge-detected. */
             int g0 = gpio_get_level(GPIO_NUM_0);
-            if (g0 == 0 && g0_prev == 1) {
-                ESP_LOGI(TAG, "G0 pressed — saving state now");
-                sdpg_flush(); save_state(""); did_save = true;
+            if (g0 == 0 && g0_prev == 1) {           /* G0 falling edge = pressed */
+                ESP_LOGI(TAG, "G0 pressed — saving state");
+                sdpg_flush();
+                save_state("");
             }
             g0_prev = g0;
-            if (did_save) { /* already saved via G0 */ }
-            else if (clk_off && !clk_off_prev) {     /* just went idle -> snapshot now */
-                ESP_LOGI(TAG, "idle (clk-off) — saving state");
-                sdpg_flush(); save_state(""); did_save = true;
-            } else if (now - boot_us > 15000000LL &&            /* past format-prompt warmup */
-                       now - last_change_us > 4000000LL &&      /* screen static >4 s        */
-                       now - last_save_us >= 30000000LL) {      /* at most once / 30 s        */
-                ESP_LOGI(TAG, "screen idle — saving state");
-                sdpg_flush(); save_state(""); did_save = true;
-            } else if (now - last_save_us >= 60000000LL && clk_off) {
-                sdpg_flush(); save_state(""); did_save = true;
-            }
-            clk_off_prev = clk_off;
-            if (did_save) last_save_us = now;
         }
         if (++hb >= 30) {
             hb = 0;
             uint32_t r = sdpg_read_count();
-            /* rtc_reg = nc2k_states.ext_reg: [0]=sec [1]=min [2]=hour. Logs whether
-             * the NC1020 clock is advancing (and how fast) vs frozen. */
             ESP_LOGI(TAG, "heartbeat: cycles=%llu  SD-reads(+%lu)  RTC=%02d:%02d:%02d",
                      (unsigned long long)nc2k_states.cycles, (unsigned long)(r - last_reads),
                      nc2k_states.ext_reg[2], nc2k_states.ext_reg[1], nc2k_states.ext_reg[0]);
