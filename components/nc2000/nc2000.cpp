@@ -35,16 +35,35 @@ void save_state(string file_name){
 	// 打印保存时的关键状态
 	printf("save_state(): sleeping=%d, lcdon=%d, lcden=%d, lcdbuffaddr=0x%x\n",
 		nc2k_states.slept, nc2k_states.lcdon, nc2k_states.lcden, nc2k_states.lcdbuffaddr);
-	FILE* file = fopen(file_name.c_str(), "wb");
+	/* Atomic save: write a complete .tmp first, then swap it in. A power-loss (the
+	 * NC1020 has no clean shutdown) can then never truncate the LIVE state — it either
+	 * survives whole or the previous good save stays. Writing in place used to leave a
+	 * half-written .state on power-loss, which load_state would then read as garbage. */
+	string tmp_name = file_name + ".tmp";
+	FILE* file = fopen(tmp_name.c_str(), "wb");
 	if (file == NULL) {
-		printf("states file %s open failed, skip saving!\n", nc2k_rom.statesPath.c_str());
+		printf("states tmp %s open failed, skip saving!\n", tmp_name.c_str());
 		return;
 	}
 	int size = &nc2k_states.SAVE_STATE_END - &nc2k_states.SAVE_STATE_BEGIN;
 	printf("saving %d bytes to state file...\n", size);
-	fwrite(&nc2k_states.SAVE_STATE_BEGIN, 1, size, file);
+	size_t wrote = fwrite(&nc2k_states.SAVE_STATE_BEGIN, 1, size, file);
 	fflush(file);
 	fclose(file);
+	if ((int)wrote != size) {                 /* short write -> keep the previous save */
+		printf("state write short (%d of %d) — discarding tmp, previous save kept\n", (int)wrote, size);
+		remove(tmp_name.c_str());
+		return;
+	}
+	/* FAT rename() fails if the destination exists, so drop it first. Crash window here
+	 * is tiny (a directory-entry op) and the worst case is a missing .state -> a clean
+	 * cold boot, never a corrupt one. */
+	remove(file_name.c_str());
+	if (rename(tmp_name.c_str(), file_name.c_str()) != 0) {
+		printf("state rename %s -> %s failed (errno=%d)\n", tmp_name.c_str(), file_name.c_str(), errno);
+		remove(tmp_name.c_str());
+		return;
+	}
 	printf("state saved to file %s!!\n",file_name.c_str());
 }
 
@@ -94,7 +113,16 @@ bool load_state(){
 	printf("fixed state values: sleeping=%d, lcdon=%d, lcden=%d, lcdbuffaddr=0x%x clk05=0x%02x\n",
 		nc2k_states.slept, nc2k_states.lcdon, nc2k_states.lcden, nc2k_states.lcdbuffaddr, nc2k_states.ram_io[0x05]);
 	super_switch();
-	return ret > 0;
+	/* Reject a TRUNCATED state (power-loss during a previous save, or a layout change
+	 * from a firmware update): a partial blob is a half-old/half-new inconsistent state
+	 * that may NOT crash — so the boot-strike crash-loop guard never fires and the user
+	 * is stuck with silent corruption. ret==size means a full, matching state; anything
+	 * else -> treat as no state (caller cold-boots into a clean session). */
+	if (ret != size) {
+		printf("state file truncated/mismatched (got %d of %d) — ignoring, cold boot\n", ret, size);
+		return false;
+	}
+	return true;
 }
 
 void LoadNC2k(){
