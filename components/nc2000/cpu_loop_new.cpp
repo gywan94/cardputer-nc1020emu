@@ -15,6 +15,7 @@
 
 
 extern nc2k_states_t nc2k_states;
+extern "C" void jit_profile_sample(uint16_t pc, uint8_t bank);   /* JIT profiler (main.cpp) */
 static u64_t& cycles = nc2k_states.cycles;
 static u64_t& last_cycles = nc2k_states.last_cycles;
 static uint8_t * rtc_reg=nc2k_states.ext_reg;
@@ -319,6 +320,9 @@ void cpu_run3(){
 			printf("\n");
 		}
 	}
+
+	/* JIT profiler hook: sample the basic-block entry PC (cheap; gated by flag). */
+	jit_profile_sample((uint16_t)nc2k_states.mPC, ram_io[0x00]);
 
 	uint32_t target_cycles=cpu_batch;
 	uint32_t CycleDelta;

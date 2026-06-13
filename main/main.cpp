@@ -15,6 +15,7 @@
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"   /* Core0->Core1 frame queue (no shared 6502 RAM) */
 
 #include "cardputer_bsp.h"
 #include "comm.h"
@@ -197,12 +198,14 @@ bool is_grey_mode();
  * frame; landscape (lx=ny, ly=nx) nearest-neighbour scale of the 160x80 image,
  * rotated in software. Redrawing only the changed rect (not all 240 rows every
  * time) kills the once-a-second full-screen rewrite that read as flicker. */
-static void draw_lcd_rect(const uint8_t *fb, int nx0, int ny0, int nx1, int ny1)
+static void draw_lcd_rect(const uint8_t *fb, bool grey, int nx0, int ny0, int nx1, int ny1)
 {
     static const uint16_t lvl[4] = {
         RGB565(245,245,245), RGB565(180,180,180), RGB565(105,105,105), RGB565(0,0,0) };
     static uint16_t line[NAT_W];
-    const bool grey = is_grey_mode();
+    /* `grey` is captured WITH the frame on Core 0 (not re-read here), so the decode
+     * always matches the bytes that were copied — no grey/1bpp mismatch on a mode
+     * switch, and Core 1 never reads emulator state. */
     if (nx0 < 0) nx0 = 0;
     if (ny0 < 0) ny0 = 0;
     if (nx1 > NAT_W) nx1 = NAT_W;
@@ -221,7 +224,7 @@ static void draw_lcd_rect(const uint8_t *fb, int nx0, int ny0, int nx1, int ny1)
         cp_lcd_draw(nx0, ny, nx1, ny + 1, line);
     }
 }
-static inline void draw_lcd(const uint8_t *fb) { draw_lcd_rect(fb, 0, 0, NAT_W, NAT_H); }
+static inline void draw_lcd(const uint8_t *fb, bool grey) { draw_lcd_rect(fb, grey, 0, 0, NAT_W, NAT_H); }
 
 /* Dump the 160x80 frame to serial as 80x40 ASCII art so the display content can
  * be verified without looking at the panel. ' '=white .=light :=dark #=black. */
@@ -589,6 +592,101 @@ static void bench_jit_feasibility(void) {
 }
 #endif
 
+/* ── JIT profiler: histogram of basic-block entry PCs (bank,pc) ──────────────
+ * cpu_run3() calls jit_profile_sample() once per ~512-cycle batch (the PC where a
+ * batch starts = a basic-block boundary). Tells us where the hot code is, i.e.
+ * which blocks are worth translating and whether the hot set is concentrated. */
+#define PROF_N 2048
+extern "C" {
+volatile bool g_jit_prof_on = false;
+static uint32_t prof_key[PROF_N];   /* (bank<<16)|pc; 0 = empty */
+static uint32_t prof_cnt[PROF_N];
+static uint64_t prof_total = 0;
+void jit_profile_sample(uint16_t pc, uint8_t bank) {
+    if (!g_jit_prof_on) return;
+    uint32_t k = ((uint32_t)bank << 16) | pc; if (!k) k = 1;
+    uint32_t h = (k * 2654435761u) & (PROF_N - 1);
+    for (int i = 0; i < PROF_N; i++) {
+        uint32_t idx = (h + i) & (PROF_N - 1);
+        if (prof_key[idx] == k) { prof_cnt[idx]++; prof_total++; return; }
+        if (prof_key[idx] == 0) { prof_key[idx] = k; prof_cnt[idx] = 1; prof_total++; return; }
+    }
+}
+}
+static void jit_profile_report(void) {
+    /* find + log the top 12 hottest (bank,pc) blocks and their % of all samples */
+    uint32_t top[12]; for (int i = 0; i < 12; i++) top[i] = 0xFFFFFFFF;  /* store idx */
+    uint32_t topc[12] = {0};
+    int distinct = 0;
+    for (int idx = 0; idx < PROF_N; idx++) {
+        if (!prof_key[idx]) continue;
+        distinct++;
+        uint32_t c = prof_cnt[idx];
+        for (int j = 0; j < 12; j++) {
+            if (c > topc[j]) {
+                for (int m = 11; m > j; m--) { topc[m] = topc[m-1]; top[m] = top[m-1]; }
+                topc[j] = c; top[j] = idx; break;
+            }
+        }
+    }
+    uint64_t tot = prof_total ? prof_total : 1;
+    ESP_LOGW(TAG, "[JIT prof] %llu samples, %d distinct blocks. Top hot blocks:", (unsigned long long)tot, distinct);
+    uint32_t topsum = 0;
+    for (int j = 0; j < 12 && top[j] != 0xFFFFFFFF; j++) {
+        uint32_t k = prof_key[top[j]];
+        topsum += topc[j];
+        ESP_LOGW(TAG, "    bank=%02x pc=%04x : %lu  (%.1f%%)",
+                 (k >> 16) & 0xff, k & 0xffff, (unsigned long)topc[j], 100.0 * topc[j] / tot);
+    }
+    ESP_LOGW(TAG, "[JIT prof] top-12 = %.0f%% of all time (concentrated=good for JIT)", 100.0 * topsum / tot);
+    /* one-shot: dump the bytes of the hot blocks so we can disassemble the 6502 */
+    {
+        extern uint8_t& Peek16Debug(uint16_t addr);
+        static bool dumped = false;
+        if (!dumped) {
+            dumped = true;
+            for (uint16_t base : (uint16_t[]){0x04c0, 0xe310, 0xad28}) {
+                char buf[160]; int p = 0;
+                for (int i = 0; i < 40; i++)
+                    p += snprintf(buf + p, sizeof(buf) - p, "%02x ", Peek16Debug((uint16_t)(base + i)));
+                ESP_LOGW(TAG, "[JIT dump] %04x: %s", base, buf);
+            }
+        }
+    }
+    /* reset the window so each report reflects only the LAST ~5s (so active use,
+     * e.g. a dictionary lookup, isn't drowned out by minutes of idle-loop samples). */
+    memset(prof_key, 0, sizeof prof_key);
+    memset(prof_cnt, 0, sizeof prof_cnt);
+    prof_total = 0;
+}
+
+/* ── Display task (Core 1) ───────────────────────────────────────────────────
+ * Core 0 snapshots the 160x80 framebuffer (CopyLcdBuffer runs on Core 0, *in
+ * sequence* with the 6502, so it never races a write — no torn lcdbuffaddr / no
+ * concurrent read of the emulator RAM, which was hanging the device during
+ * grey-mode "绘图") and hands the finished frame to this task through a FreeRTOS
+ * queue. This task owns a private copy: it touches NO emulator RAM, so the two
+ * cores never read/write the same memory. It blocks on the queue (fully yields →
+ * feeds the Core-1 idle/​watchdog) and only wakes when a new frame is ready, then
+ * does the slow ~14ms SPI stretch-blit. Output stays uniform and the hang is gone. */
+/* One self-contained frame handed Core 0 -> Core 1: the pixels AND the grey flag
+ * that was in effect when they were captured, so Core 1 decodes them correctly
+ * without ever reading emulator state. */
+typedef struct { uint8_t grey; uint8_t fb[sizeof(lcd_buf)]; } frame_msg_t;
+static QueueHandle_t g_frame_q = NULL;          /* depth-1 mailbox of full frames */
+static volatile uint32_t g_disp_draws = 0;      /* diag: actual blits done */
+static void display_task(void *arg)
+{
+    (void)arg;
+    static frame_msg_t show;                     /* private — never shared with Core 0 */
+    for (;;) {
+        if (xQueueReceive(g_frame_q, &show, portMAX_DELAY) == pdTRUE) {
+            draw_lcd(show.fb, show.grey != 0);
+            g_disp_draws++;
+        }
+    }
+}
+
 extern "C" void app_main(void) {
     ESP_LOGI(TAG, "=== cardputer-nc1020 (wqx) M2 self-test ===");
 
@@ -683,6 +781,17 @@ extern "C" void app_main(void) {
 #endif
     int flush_tick = 0, hb = 0;
     uint32_t last_reads = 0;
+    /* Dual-core (user design): Core 0 = 6502 + input + save + frame snapshot;
+     * Core 1 = SPI stretch-blit. They share NO RAM — frames cross via this queue. */
+    g_frame_q = xQueueCreate(1, sizeof(frame_msg_t));   /* depth-1 latest-frame mailbox */
+    if (!g_frame_q) {
+        ESP_LOGE(TAG, "frame queue alloc failed (%u B) — running without Core-1 display",
+                 (unsigned)sizeof(frame_msg_t));
+    } else if (xTaskCreatePinnedToCore(display_task, "lcd", 6144, NULL, 5, NULL, 1) != pdPASS) {
+        ESP_LOGE(TAG, "display_task create failed — running without Core-1 display");
+        vQueueDelete(g_frame_q);
+        g_frame_q = NULL;                                /* snapshot block skips enqueue */
+    }
 #define KEY_SWEEP_TEST 0     /* interactivity confirmed; physical keyboard now drives it */
     for (;;) {
         fast_forward = false;
@@ -739,17 +848,34 @@ extern "C" void app_main(void) {
             }
         }
 #endif
-        /* Single-core synchronous draw (the version that looked clean). Snapshot the
-         * NC1020 frame, skip blank/unchanged frames, and blit it right here. Dual-core
-         * offload of the blit hurt image quality (async timing) without speeding up
-         * the run — the 6502 interpreter, not the display, is the bottleneck. */
-        if (CopyLcdBuffer(lcd_buf)) {
-            bool blank = true;
-            for (size_t i = 0; i < sizeof(lcd_buf); i++) if (lcd_buf[i]) { blank = false; break; }
+        /* Snapshot the frame ON CORE 0 (sequential with the 6502 → no torn read,
+         * no cross-core RAM race) at ~30fps and hand it to Core 1 via the queue.
+         * Only enqueue non-blank changed frames so a static screen costs nothing
+         * and Core 1 stays blocked (idle/watchdog fed). xQueueOverwrite keeps just
+         * the latest frame, so a slow blit never backs up a queue. */
+        if (g_frame_q) {
+            static int64_t last_snap = 0;
+            static frame_msg_t snap;
             static uint8_t prev[sizeof(lcd_buf)];
-            if (!blank && memcmp(lcd_buf, prev, sizeof(lcd_buf)) != 0) {
-                draw_lcd(lcd_buf);
-                memcpy(prev, lcd_buf, sizeof(lcd_buf));
+            static uint8_t prev_grey = 0xff;             /* force first enqueue */
+            int64_t now = esp_timer_get_time();
+            if (now - last_snap >= 33000) {              /* ~30 fps cap */
+                last_snap = now;
+                /* Capture grey ON CORE 0, alongside the pixels CopyLcdBuffer copies
+                 * for that same mode — keeps decode and bytes consistent (finding #1). */
+                snap.grey = is_grey_mode() ? 1 : 0;
+                if (CopyLcdBuffer(snap.fb)) {
+                    /* Live bytes: 1600 in 1bpp, 3200 in grey — only scan/diff those. */
+                    size_t live = snap.grey ? sizeof(snap.fb) : (sizeof(snap.fb) / 2);
+                    bool blank = true;
+                    for (size_t i = 0; i < live; i++) if (snap.fb[i]) { blank = false; break; }
+                    if (!blank && (snap.grey != prev_grey ||
+                                   memcmp(snap.fb, prev, live) != 0)) {
+                        memcpy(prev, snap.fb, live);
+                        prev_grey = snap.grey;
+                        xQueueOverwrite(g_frame_q, &snap);
+                    }
+                }
             }
         }
 
@@ -775,10 +901,14 @@ extern "C" void app_main(void) {
         if (++hb >= 30) {
             hb = 0;
             uint32_t r = sdpg_read_count();
-            ESP_LOGI(TAG, "heartbeat: cycles=%llu  SD-reads(+%lu)  RTC=%02d:%02d:%02d",
+            static uint32_t last_draws = 0; uint32_t dd = g_disp_draws;
+            ESP_LOGI(TAG, "heartbeat: cycles=%llu  SD-reads(+%lu)  RTC=%02d:%02d:%02d  draws(+%lu)",
                      (unsigned long long)nc2k_states.cycles, (unsigned long)(r - last_reads),
-                     nc2k_states.ext_reg[2], nc2k_states.ext_reg[1], nc2k_states.ext_reg[0]);
-            last_reads = r;
+                     nc2k_states.ext_reg[2], nc2k_states.ext_reg[1], nc2k_states.ext_reg[0],
+                     (unsigned long)(dd - last_draws));
+            last_reads = r; last_draws = dd;
+            static int prof_tick = 0;
+            if (++prof_tick >= 12) { prof_tick = 0; jit_profile_report(); }   /* ~every 5s */
             /* after 30 s stable, clear the boot flag — state is good */
             static bool bootflag_cleared = false;
             if (!bootflag_cleared) {
