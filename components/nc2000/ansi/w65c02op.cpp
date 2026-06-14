@@ -9,7 +9,6 @@ extern "C" {
 #include <cassert>
 #include "cpu.h"
 #include "comm.h"
-#include "esp_attr.h"   /* IRAM_ATTR — try placing the hot interpreter in IRAM */
 
 const bool enable_illegal_op_fix=true;
 const bool enable_irq_nmi_cycle_fix=true;
@@ -21,7 +20,7 @@ const bool enable_irq_nmi_cycle_fix=true;
 
 void xILLEGAL(void);
 
-IRAM_ATTR DWORD CpuExecuteOP(DWORD total, int max_cycles)
+DWORD CpuExecuteOP(DWORD total, int max_cycles)
 {
     /* Cache the 6502 registers in locals for the whole batch. As nc2k_states
      * members they alias the uint8_t RAM/display stores (char aliases anything),
