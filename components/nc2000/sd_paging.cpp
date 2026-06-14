@@ -12,12 +12,15 @@
  * fragmented (largest contiguous block ~72 KB) to hold 32 KB slots. 8 KB slots
  * pack into the fragments and let enough banks stay pinned per bus switch. */
 #define SDPG_PAGE    0x2000u   /* 8 KB per slot                                   */
-#define SDPG_NSLOTS  10        /* 10*8KB = 80 KB. Max live pages/switch is 6 (4    */
-                               /* subpages + nor[0] + nor[bbs]). Was 14 (112KB);   */
-                               /* cut to free ~32KB internal RAM for the FAT/SD     */
-                               /* mount (it failed with NO_MEM 0x101 after recent   */
-                               /* static allocs). ROM+NOR are in flash so SD reads  */
-                               /* are ~0 and the paging cache is barely used.       */
+#define SDPG_NSLOTS  7         /* 7*8KB = 56 KB. Max live pages/switch is 6 (4      */
+                               /* subpages + nor[0] + nor[bbs]), so 7 = 1-slot      */
+                               /* margin. Cut 10->7 to free 24KB so the hot         */
+                               /* interpreter can live in IRAM (IRAM_ATTR on        */
+                               /* CpuExecuteOP, +7%) AND the FAT/SD mount still      */
+                               /* fits (IRAM eats ~32KB of DRAM; SD mount needs a    */
+                               /* contiguous block — NO_MEM 0x101 otherwise).       */
+                               /* ROM+NOR are in flash so SD reads are ~0 and the    */
+                               /* paging cache is barely used anyway.                */
 #define ROM_PAGES    1536u     /* 12 MB / 8 KB = 384 banks * 4                     */
 
 static const char *TAG = "sdpg";
